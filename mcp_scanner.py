@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+SLYE-MCP-Security Scanner
+Simple, Light, Yet Effective MCP Security Scanner
+by en0f
+
 MCP (Model Context Protocol) Server Security Scanner
 A tool for identifying security vulnerabilities in MCP server deployments
 """
