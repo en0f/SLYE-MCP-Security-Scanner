@@ -507,8 +507,8 @@ class MCPScanner:
         print("  - Use strong API keys and implement proper access controls")
         print("  - Implement network-level protection (firewall, WAF, etc.)")
         
-        print("\nNOTE: This is a basic security scan. For a comprehensive security assessment,")
-        print("consider engaging with security professionals for a full penetration test.")
+        print("\nNOTE: This is just a quick and light security scan. For a comprehensive security assessment,")
+        print("consider engaging with security professionals for a full in-depth testing.")
         print("=" * 60)
 
 def main():
