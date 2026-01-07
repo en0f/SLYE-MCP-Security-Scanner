@@ -1,5 +1,6 @@
 # SLYE-MCP-Security-Scanner
 Simple, Light, Yet Effective MCP Security Scanner
+by en0f
 
 This MCP (Model Context Protocol) server scanner is designed to identify common security issues in model serving infrastructure. It performs several key checks:
 
