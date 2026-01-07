@@ -1,4 +1,4 @@
-# SLYE-MCP-Security-Scanner
+SLYE-MCP-Security-Scanner
 Simple, Light, Yet Effective MCP Security Scanner
 by en0f
 
