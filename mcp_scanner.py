@@ -20,19 +20,24 @@ from concurrent.futures import ThreadPoolExecutor
 import base64
 import urllib3
 from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime
+import html as html_module
+import mimetypes
 
 # Disable insecure HTTPS warnings for testing
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class MCPScanner:
     def __init__(self, target: str, port: int = 443, timeout: int = 10, 
-                 verbose: bool = False, use_ssl: bool = True, api_key: str = None):
+                 verbose: bool = False, use_ssl: bool = True, api_key: str = None,
+                 export_path: Optional[str] = None):
         self.target = target
         self.port = port
         self.timeout = timeout
         self.verbose = verbose
         self.use_ssl = use_ssl
         self.api_key = api_key
+        self.export_path = export_path
         self.vulnerabilities = []
         self.server_info = {}
         self.risk_score = 0
@@ -411,6 +416,221 @@ class MCPScanner:
             except Exception as e:
                 self.log(f"Error testing endpoint {endpoint}: {e}", "ERROR")
     
+    def check_security_headers(self) -> None:
+        """Check for proper security headers configuration"""
+        self.log("Checking security headers...")
+        
+        headers_to_check = {
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": None,  # Any value is good
+            "X-XSS-Protection": None,
+            "Strict-Transport-Security": None,
+            "Content-Security-Policy": None,
+            "Access-Control-Allow-Origin": None
+        }
+        
+        try:
+            response = requests.get(f"{self.base_url}/v1/models", verify=False, timeout=self.timeout)
+            response_headers = response.headers
+            
+            missing_headers = []
+            insecure_headers = []
+            
+            for header, expected_value in headers_to_check.items():
+                if header not in response_headers:
+                    missing_headers.append(header)
+                else:
+                    value = response_headers[header]
+                    # Check for overly permissive CORS
+                    if header == "Access-Control-Allow-Origin" and value == "*":
+                        insecure_headers.append((header, "Allows access from any origin"))
+            
+            if missing_headers:
+                self.vulnerabilities.append({
+                    "severity": "MEDIUM",
+                    "title": "Missing security headers",
+                    "description": f"Missing headers: {', '.join(missing_headers)}"
+                })
+                self.risk_score += 4
+                self.log(f"Missing security headers: {missing_headers}", "WARNING")
+            
+            if insecure_headers:
+                for header, issue in insecure_headers:
+                    self.vulnerabilities.append({
+                        "severity": "MEDIUM",
+                        "title": f"Insecure {header} configuration",
+                        "description": issue
+                    })
+                    self.risk_score += 3
+            
+            self.server_info["security_headers"] = dict(response_headers)
+            
+        except Exception as e:
+            self.log(f"Error checking security headers: {e}", "ERROR")
+    
+    def check_mcp_tools(self) -> None:
+        """Check MCP-specific tool definitions and permissions"""
+        self.log("Checking MCP tool configurations...")
+        
+        # Check for tools endpoint
+        tools_endpoints = [
+            "/v1/tools",
+            "/tools",
+            "/api/tools",
+            "/mcp/tools"
+        ]
+        
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        
+        tools_found = []
+        
+        for endpoint in tools_endpoints:
+            url = f"{self.base_url}{endpoint}"
+            try:
+                response = requests.get(url, headers=headers, verify=False, timeout=self.timeout)
+                if response.status_code == 200:
+                    tools_data = response.json()
+                    self.log(f"Found tools endpoint: {endpoint}", "INFO")
+                    
+                    if isinstance(tools_data, dict) and "tools" in tools_data:
+                        tools_list = tools_data["tools"]
+                    elif isinstance(tools_data, list):
+                        tools_list = tools_data
+                    else:
+                        continue
+                    
+                    for tool in tools_list:
+                        tool_name = tool.get("name", "unknown")
+                        tools_found.append(tool_name)
+                        
+                        # Check for required security properties
+                        if "inputSchema" not in tool and "parameters" not in tool:
+                            self.vulnerabilities.append({
+                                "severity": "MEDIUM",
+                                "title": f"Tool '{tool_name}' missing input validation schema",
+                                "description": "Tool parameters are not properly defined"
+                            })
+                            self.risk_score += 4
+                        
+                        # Check if tool allows unrestricted access
+                        description = tool.get("description", "").lower()
+                        if "dangerous" in description or "unrestricted" in description:
+                            self.vulnerabilities.append({
+                                "severity": "HIGH",
+                                "title": f"Dangerous tool exposed: {tool_name}",
+                                "description": "Tool is marked as potentially dangerous"
+                            })
+                            self.risk_score += 6
+                    
+                    if tools_found:
+                        self.server_info["available_tools"] = tools_found
+                        self.log(f"Found {len(tools_found)} tools: {', '.join(tools_found)}", "INFO")
+                    
+            except requests.exceptions.RequestException:
+                continue
+            except Exception as e:
+                self.log(f"Error checking tools endpoint {endpoint}: {e}", "ERROR")
+        
+        if not tools_found:
+            self.log("No tools endpoint found - checking if tools are embedded in model responses")
+    
+    def check_authentication_security(self) -> None:
+        """Enhanced authentication testing including JWT validation and token checks"""
+        if self.api_key is None:
+            self.log("Skipping enhanced authentication checks - no API key provided")
+            return
+        
+        self.log("Performing enhanced authentication security checks...")
+        
+        # Test 1: Check for token expiration handling
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        url = f"{self.base_url}/v1/models"
+        
+        try:
+            response = requests.get(url, headers=headers, verify=False, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                # Token is valid, check response headers for token info
+                if "X-RateLimit-Remaining" in response.headers:
+                    self.server_info["supports_rate_limit_headers"] = True
+                    self.log("Server provides rate limit information in headers")
+        except Exception as e:
+            self.log(f"Error testing token validity: {e}", "ERROR")
+        
+        # Test 2: Check if API key is JWT and analyze it
+        if self.api_key.count('.') == 2:  # JWT format (header.payload.signature)
+            self.log("Detected JWT format API key")
+            try:
+                # Decode JWT header and payload (without verification)
+                parts = self.api_key.split('.')
+                header_data = base64.urlsafe_b64decode(parts[0] + '='*(-len(parts[0]) % 4))
+                payload_data = base64.urlsafe_b64decode(parts[1] + '='*(-len(parts[1]) % 4))
+                
+                header_json = json.loads(header_data)
+                payload_json = json.loads(payload_data)
+                
+                self.log(f"JWT Header: {header_json}", "INFO")
+                self.log(f"JWT Payload keys: {list(payload_json.keys())}", "INFO")
+                
+                # Check for weak algorithms
+                if header_json.get("alg") in ["none", "HS256"]:
+                    if header_json.get("alg") == "none":
+                        self.vulnerabilities.append({
+                            "severity": "CRITICAL",
+                            "title": "JWT with 'none' algorithm",
+                            "description": "JWT uses no signature verification algorithm"
+                        })
+                        self.risk_score += 10
+                    else:
+                        self.vulnerabilities.append({
+                            "severity": "MEDIUM",
+                            "title": "JWT using HS256 algorithm",
+                            "description": "HS256 is less secure than RS256 for APIs"
+                        })
+                        self.risk_score += 3
+                
+                # Check for expiration
+                if "exp" in payload_json:
+                    exp_time = payload_json["exp"]
+                    current_time = time.time()
+                    if exp_time < current_time:
+                        self.vulnerabilities.append({
+                            "severity": "HIGH",
+                            "title": "Expired JWT token",
+                            "description": "The provided JWT token has expired"
+                        })
+                        self.risk_score += 7
+                    else:
+                        time_remaining = (exp_time - current_time) / 3600
+                        self.log(f"JWT expires in {time_remaining:.1f} hours")
+                        if time_remaining < 24:
+                            self.log("Token expiring soon (less than 24 hours)", "WARNING")
+                
+                # Check for scopes/permissions
+                if "scope" in payload_json:
+                    scopes = payload_json["scope"]
+                    self.server_info["api_key_scopes"] = scopes
+                    self.log(f"API key scopes: {scopes}")
+                
+            except Exception as e:
+                self.log(f"Could not decode JWT: {e}", "ERROR")
+        
+        # Test 3: Check for API key in URL parameters (security issue)
+        test_url = f"{self.base_url}/v1/models?api_key={self.api_key}"
+        try:
+            response = requests.get(test_url, verify=False, timeout=self.timeout)
+            if response.status_code == 200:
+                self.vulnerabilities.append({
+                    "severity": "HIGH",
+                    "title": "API key accepted in URL parameters",
+                    "description": "API keys should only be sent in Authorization headers, not URL parameters"
+                })
+                self.risk_score += 6
+        except Exception:
+            pass
+    
     def run_scan(self) -> Dict[str, Any]:
         """Run all security checks and return results"""
         start_time = time.time()
@@ -429,7 +649,10 @@ class MCPScanner:
         # Run all checks
         self.scan_open_endpoints()
         self.check_tls_configuration()
+        self.check_security_headers()
+        self.check_mcp_tools()
         self.check_model_access_control()
+        self.check_authentication_security()
         self.check_rate_limiting()
         self.check_injection_vulnerabilities()
         self.check_error_disclosure()
@@ -458,7 +681,253 @@ class MCPScanner:
         }
         
         self.print_report(results)
+        
+        # Export results if export path specified
+        if self.export_path:
+            if self.export_path.endswith('.html'):
+                self.export_html(results)
+            elif self.export_path.endswith('.json'):
+                self.export_json(results)
+            else:
+                # Export both formats if no extension specified
+                self.export_json(results)
+                self.export_html(results)
+        
         return results
+    
+    def export_json(self, results: Dict[str, Any]) -> str:
+        """Export scan results to JSON format"""
+        json_path = self.export_path if self.export_path else f"mcp_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        try:
+            with open(json_path, 'w') as f:
+                json.dump(results, f, indent=2)
+            self.log(f"Results exported to JSON: {json_path}")
+            return json_path
+        except Exception as e:
+            self.log(f"Error exporting JSON: {e}", "ERROR")
+            return None
+    
+    def export_html(self, results: Dict[str, Any]) -> str:
+        """Export scan results to HTML format"""
+        html_path = (self.export_path.replace('.json', '.html') 
+                     if self.export_path and self.export_path.endswith('.json')
+                     else (self.export_path if self.export_path else 
+                           f"mcp_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"))
+        
+        try:
+            # Generate HTML content
+            severity_colors = {
+                "CRITICAL": "#dc2626",
+                "HIGH": "#ea580c",
+                "MEDIUM": "#f59e0b",
+                "LOW": "#10b981"
+            }
+            
+            html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCP Security Scan Report</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }}
+        h1, h2, h3 {{
+            margin-top: 0;
+            color: #1f2937;
+        }}
+        .risk-score {{
+            font-size: 36px;
+            font-weight: bold;
+            margin: 20px 0;
+        }}
+        .risk-level {{
+            display: inline-block;
+            padding: 10px 20px;
+            border-radius: 4px;
+            font-weight: bold;
+            margin-right: 15px;
+        }}
+        .scan-info {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .scan-info p {{
+            margin: 10px 0;
+        }}
+        .vulnerability {{
+            background: white;
+            border-left: 5px solid #ccc;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .severity-critical {{ border-left-color: {severity_colors['CRITICAL']}; }}
+        .severity-high {{ border-left-color: {severity_colors['HIGH']}; }}
+        .severity-medium {{ border-left-color: {severity_colors['MEDIUM']}; }}
+        .severity-low {{ border-left-color: {severity_colors['LOW']}; }}
+        .severity-badge {{
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 4px;
+            color: white;
+            font-weight: bold;
+            font-size: 12px;
+        }}
+        .severity-critical .severity-badge {{ background-color: {severity_colors['CRITICAL']}; }}
+        .severity-high .severity-badge {{ background-color: {severity_colors['HIGH']}; }}
+        .severity-medium .severity-badge {{ background-color: {severity_colors['MEDIUM']}; }}
+        .severity-low .severity-badge {{ background-color: {severity_colors['LOW']}; }}
+        .vuln-title {{
+            font-size: 18px;
+            font-weight: 600;
+            margin: 10px 0;
+            color: #1f2937;
+        }}
+        .vuln-desc {{
+            color: #666;
+            margin: 5px 0;
+        }}
+        .server-info {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .info-item {{
+            margin: 10px 0;
+            padding: 10px;
+            background: #f9fafb;
+            border-radius: 4px;
+        }}
+        .recommendations {{
+            background: #ecf0f1;
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }}
+        .recommendations ul {{
+            margin: 10px 0;
+            padding-left: 20px;
+        }}
+        .recommendations li {{
+            margin: 8px 0;
+        }}
+        .footer {{
+            color: #666;
+            font-size: 12px;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #ddd;
+            text-align: center;
+        }}
+    </style>
+</head>
+<body>
+    <header>
+        <h1>MCP Server Security Scan Report</h1>
+        <p><strong>Target:</strong> {html_module.escape(results['target'])}:{results['port']} ({results['protocol']})</p>
+        <p><strong>Scan Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <p><strong>Scan Duration:</strong> {results['scan_duration_seconds']} seconds</p>
+        <div class="risk-score">Risk Score: {results['risk_score']}</div>
+        <div>
+            <span class="risk-level" style="background-color: {severity_colors.get(results['risk_level'], '#999')};">
+                {results['risk_level']} RISK
+            </span>
+        </div>
+    </header>"""
+            
+            # Server Information
+            if results['server_info']:
+                html_content += """
+    <section class="server-info">
+        <h2>Server Information</h2>"""
+                for key, value in results['server_info'].items():
+                    if isinstance(value, (list, dict)):
+                        html_content += f'<div class="info-item"><strong>{html_module.escape(key.replace("_", " ").title())}:</strong><br><pre>{html_module.escape(json.dumps(value, indent=2))}</pre></div>'
+                    else:
+                        html_content += f'<div class="info-item"><strong>{html_module.escape(key.replace("_", " ").title())}:</strong> {html_module.escape(str(value))}</div>'
+                html_content += "</section>"
+            
+            # Vulnerabilities
+            if results['vulnerabilities']:
+                html_content += """
+    <section>
+        <h2>Vulnerabilities Found</h2>"""
+                for vuln in results['vulnerabilities']:
+                    severity_class = f"severity-{vuln['severity'].lower()}"
+                    html_content += f"""
+        <div class="vulnerability {severity_class}">
+            <span class="severity-badge">{html_module.escape(vuln['severity'])}</span>
+            <div class="vuln-title">{html_module.escape(vuln['title'])}</div>
+            <div class="vuln-desc">{html_module.escape(vuln['description'])}</div>
+        </div>"""
+                html_content += "</section>"
+            else:
+                html_content += "<section><p style='color: green; font-weight: bold;'>✓ No vulnerabilities found!</p></section>"
+            
+            # Recommendations
+            html_content += """
+    <section class="recommendations">
+        <h2>Recommendations</h2>
+        <ul>"""
+            
+            if any("TLS" in v['title'] for v in results['vulnerabilities']):
+                html_content += "<li>Upgrade to TLS 1.2 or higher and configure secure cipher suites</li>"
+            if any("rate limiting" in v['title'].lower() for v in results['vulnerabilities']):
+                html_content += "<li>Implement proper rate limiting to prevent abuse and DoS attacks</li>"
+            if any("injection" in v['title'].lower() for v in results['vulnerabilities']):
+                html_content += "<li>Implement input validation and prompt security mechanisms</li>"
+            if any("authentication" in v['title'].lower() for v in results['vulnerabilities']):
+                html_content += "<li>Enforce proper authentication for all API endpoints</li>"
+            if any("error" in v['title'].lower() for v in results['vulnerabilities']):
+                html_content += "<li>Configure generic error messages without sensitive information</li>"
+            if any("header" in v['title'].lower() for v in results['vulnerabilities']):
+                html_content += "<li>Add missing security headers (CSP, X-Frame-Options, etc.)</li>"
+            if any("tool" in v['title'].lower() for v in results['vulnerabilities']):
+                html_content += "<li>Implement proper tool validation and access controls</li>"
+            
+            html_content += """
+            <li>Regularly update the MCP server software to the latest version</li>
+            <li>Use strong API keys and implement proper access controls</li>
+            <li>Implement network-level protection (firewall, WAF, etc.)</li>
+        </ul>
+    </section>
+    
+    <div class="footer">
+        <p>NOTE: This is a quick and light security scan. For comprehensive security assessment, engage security professionals.</p>
+    </div>
+</body>
+</html>"""
+            
+            with open(html_path, 'w') as f:
+                f.write(html_content)
+            
+            self.log(f"Results exported to HTML: {html_path}")
+            return html_path
+        except Exception as e:
+            self.log(f"Error exporting HTML: {e}", "ERROR")
+            return None
     
     def print_report(self, results: Dict[str, Any]) -> None:
         """Print a formatted scan report"""
@@ -519,6 +988,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--no-ssl", action="store_true", help="Disable SSL/TLS")
     parser.add_argument("-k", "--api-key", help="API key for authenticated testing")
+    parser.add_argument("-o", "--output", help="Export results to file (JSON, HTML, or both if no extension)")
     
     args = parser.parse_args()
     
@@ -528,7 +998,8 @@ def main():
         timeout=args.timeout,
         verbose=args.verbose,
         use_ssl=not args.no_ssl,
-        api_key=args.api_key
+        api_key=args.api_key,
+        export_path=args.output
     )
     
     try:
